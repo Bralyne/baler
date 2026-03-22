@@ -212,8 +212,6 @@ def numpy_to_tensor(data):
 
 
 def normalize(data, custom_norm):
-    # Remove the np.apply_along_axis loop. 
-    # Just call the function once with the whole dataset.
     data = data_processing.normalize(data, custom_norm=custom_norm)
     return data
 
@@ -256,7 +254,7 @@ def renormalize(data, true_min_list, feature_range_list):
 
 
 def train(model, number_of_columns, train_set, test_set, project_path, config, tracker=None):
-    # IMPROVEMENT: tracker=None added to pass the EmissionTracker into the core loop
+    # tracker=None added to pass the EmissionTracker into the core loop
     return training.train(
         model, number_of_columns, train_set, test_set, project_path, config, tracker=tracker
     )
@@ -498,7 +496,7 @@ def perform_hls4ml_conversion(output_path, config):
     hls_model.build(csim=config.csim, synth=config.synth, cosim=config.cosim, export=config.export)
     
     
-   #function to create a csv to collect metrics during each process(Training, compress and decompress)
+   #function to create a CSV to collect metrics during each process(Training, compress, and decompress)
 def add_to_performance_log(path, metrics_dict, file_name="training_metrics.csv"):
     """
     Appends a dictionary of metrics as a new row in a CSV file using the csv module.
