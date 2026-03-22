@@ -8,7 +8,7 @@ import sys
 def get_cumulative_metrics(file_path, is_training):
     """
     Processes the CSV: sums all rows for training, 
-    takes the last row for compression/decompression.
+    
     """
     if not os.path.exists(file_path):
         print(f"Warning: {file_path} not found.")
@@ -49,12 +49,12 @@ def plot_comparisons(base_output_path):
         "Training": os.path.join(base_output_path, "training", "emission_training.csv")
     }
 
-    # 2. Collect and Process Data
+    # Collect and Process Data
     results = {}
     for mode, path in files.items():
         results[mode] = get_cumulative_metrics(path, is_training=(mode == "Training"))
 
-    # 3. Format Data for Plotting
+    # Format Data for Plotting
     KWH_TO_JOULES = 3.6e6
     hw_data = []
     summary_data = []
@@ -80,11 +80,11 @@ def plot_comparisons(base_output_path):
     df_hw = pd.DataFrame(hw_data)
     df_sum = pd.DataFrame(summary_data)
 
-    # --- PLOTTING (Unified Layout) ---
+    # PLOTTING ---
     sns.set_theme(style="whitegrid")
     hw_palette = ["#1f77b4", "#ff7f0e", "#2ca02c"] # Blue, Orange, Green
 
-    # Create a large figure to hold all plots
+    # Create figure 
     fig = plt.figure(figsize=(14, 12))
 
     # Define grid: 2 rows, 2 columns
@@ -95,14 +95,14 @@ def plot_comparisons(base_output_path):
     # ax3 (Duration) is Row 1, Col 1
     ax3 = plt.subplot2grid((2, 2), (1, 1))
 
-    # 1. Hardware Energy Plot
+    # Hardware Energy Plot
     sns.barplot(data=df_hw, x="Procedure", y="Energy (J)", hue="Hardware", palette=hw_palette, ax=ax1)
     ax1.set_yscale('log')
     ax1.set_title("Energy Consumption per Hardware Component", fontsize=15, fontweight='bold')
     ax1.set_ylabel("Log(Energy [J])", fontsize=12)
     ax1.set_xlabel("Procedure", fontsize=12)
 
-    # 2. Total CO2 Emission Plot
+    # Total CO2 Emission Plot
     sns.barplot(data=df_sum, x="Procedure", y="CO2 Emission (kg)", ax=ax2, color="#1f77b4")
     ax2.set_yscale('log')
     ax2.set_title("Total CO2 Emission", fontsize=14, fontweight='bold')
