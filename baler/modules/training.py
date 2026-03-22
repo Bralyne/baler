@@ -75,7 +75,7 @@ def fit(config, model, train_dl, model_children, regular_param, optimizer, laten
     return epoch_loss, running_mse/(idx+1), running_l1/(idx+1), model
 
 def validate(model, test_dl, model_children, reg_param):
-     """Function used to validate the training. Not necessary for doing compression, but gives a good indication of wether the model selected is a good fit or not.
+    """Function used to validate the training. Not necessary for doing compression, but gives a good indication of wether the model selected is a good fit or not.
     Args:
         model (modelObject): Defines the model one wants to validate. The model used here is passed directly from `fit()`.
         test_dl (torch.DataLoader): Defines the batched data which the model is validated on
@@ -84,7 +84,7 @@ def validate(model, test_dl, model_children, reg_param):
     Returns:
         float: Validation loss
     """
-     print("### Beginning Validating")
+    print("### Beginning Validating")
     model.eval()
     running_loss = 0.0
     device = helper.get_device()
@@ -191,8 +191,8 @@ def train(model, variables, train_data, test_data, project_path, config, tracker
 
         if config.lr_scheduler: lr_scheduler(v_loss)
         
-        # CARBON METRICS
-        #  flush the tracker to ensure a row is written for every epoch
+        # --- CARBON METRICS 
+        #flush the tracker to ensure a row is written for every epoch
         if tracker is not None:
             tracker.flush()
 
