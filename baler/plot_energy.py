@@ -13,7 +13,7 @@ def plot_training_emissions(folder_path, total_epochs):
         print(f"Error: {csv_path} not found.")
         return
 
-    # 1. LOAD DATA
+    #LOAD DATA
     raw_data = {"cpu": [], "gpu": [], "ram": [], "total": [], "time": [], "co2": []}
     
     with open(csv_path, mode='r') as f:
@@ -26,21 +26,21 @@ def plot_training_emissions(folder_path, total_epochs):
             raw_data["time"].append(float(row.get("duration", 0)))
             raw_data["co2"].append(float(row.get("emissions", 0)))
 
-    # 2. CALCULATE DELTAS
-    # We want exactly 'total_epochs' worth of differences.
-    # If the CSV has more rows than epochs, we slice it to match your input.
+    # CALCULATE DELTAS
+    # We want exactly total_epochs worth of differences.
+
     KWH_TO_JOULES = 3.6e6
     deltas = {}
 
     for key in raw_data.keys():
-        # Trim data to total_epochs to avoid the (11,) vs (12,) error
+       
         data_trimmed = raw_data[key][:total_epochs]
         
-        # Prepend 0 to get the delta for the first epoch
+        
         data_with_base = np.insert(data_trimmed, 0, 0.0)
         diff_result = np.diff(data_with_base)
         
-        # Prepend another 0 so the plot starts at (0,0)
+        
         final_plot_data = np.insert(diff_result, 0, 0.0)
         
         if key in ["time", "co2"]:
@@ -48,13 +48,13 @@ def plot_training_emissions(folder_path, total_epochs):
         else:
             deltas[key] = final_plot_data * KWH_TO_JOULES
 
-    # 3. SET THE X-AXIS
+    # SET THE X-AXIS
     # This will be exactly [0, 1, 2, ..., total_epochs] (11 points)
     x_axis = np.arange(0, total_epochs + 1)
 
     with PdfPages(output_pdf) as pdf:
         
-        # --- PAGE 1: HARDWARE ENERGY (J) ---
+        # PAGE 1: HARDWARE ENERGY (J) ---
         fig1, axes1 = plt.subplots(1, 3, figsize=(18, 5))
         hw_configs = [('cpu', 'CPU Energy (J)'), 
                       ('gpu', 'GPU Energy (J)'), 
@@ -72,7 +72,7 @@ def plot_training_emissions(folder_path, total_epochs):
         pdf.savefig(fig1)
         plt.close()
 
-        # --- PAGE 2: TOTAL CONSUMPTION (J) & DURATION (s) ---
+        # PAGE 2: TOTAL CONSUMPTION (J) and DURATION (s) ---
         fig2, (ax_e, ax_d) = plt.subplots(1, 2, figsize=(14, 5))
         
         ax_e.plot(x_axis, deltas["total"], color='tab:blue', linewidth=1)
@@ -93,7 +93,7 @@ def plot_training_emissions(folder_path, total_epochs):
         pdf.savefig(fig2)
         plt.close()
 
-        # --- PAGE 3: CO2 EMISSIONS (kg) ---
+        # PAGE 3: CO2 EMISSIONS (kg) ---
         fig3, ax3 = plt.subplots(figsize=(8, 5))
         ax3.plot(x_axis, deltas["co2"], color='tab:blue', linewidth=1)
         ax3.set_title("CO2 Emission")
@@ -106,7 +106,7 @@ def plot_training_emissions(folder_path, total_epochs):
         pdf.savefig(fig3)
         plt.close()
 
-    print(f"Success! PDF generated for {total_epochs} epochs.")
+    print(f" PDF generated for {total_epochs} epochs.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
