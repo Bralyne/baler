@@ -19,6 +19,7 @@ import sys
 from dataclasses import dataclass
 from math import ceil
 import gzip
+import csv
 
 from tqdm import tqdm
 
@@ -32,12 +33,7 @@ from ..modules import training, plotting, data_processing, diagnostics
 
 
 def get_arguments():
-    """Determines the arguments one is able to apply in the command line when running Baler. Use `--help` to see what
-    options are available.
-
-    Returns: .py, string, folder: `.py` file containing the config options, string determining what mode to run,
-    projects directory where outputs go.
-    """
+    """Determines the arguments one is able to apply in the command line when running Baler."""
     parser = argparse.ArgumentParser(
         prog="baler",
         description=(
@@ -67,11 +63,6 @@ def get_arguments():
         metavar=("WORKSPACE", "PROJECT"),
         help="Specifies workspace and project.\n"
         "e.g. --project CFD firstTry"
-        ", specifies workspace 'CFD' and project 'firstTry'\n\n"
-        "When combined with newProject mode:\n"
-        "  1. If workspace and project exist, take no action.\n"
-        "  2. If workspace exists but project does not, create project in workspace.\n"
-        "  3. If workspace does not exist, create workspace directory and project.",
     )
     parser.add_argument(
         "--verbose", dest="verbose", action="store_true", help="Verbose mode"
@@ -89,7 +80,10 @@ def get_arguments():
     if args.mode == "newProject":
         config = None
     else:
-        config = Config
+        # Create an instance of the class so it can hold data
+        config = Config() 
+        module = importlib.import_module(config_path)
+        module.set_config(config)
         importlib.import_module(config_path).set_config(config)
 
     return (
@@ -107,15 +101,6 @@ def create_new_project(
     verbose: bool = False,
     base_path: str = "workspaces",
 ) -> None:
-    """Creates a new project directory output subdirectories and config files within a workspace.
-
-    Args:
-        workspace_name (str): Creates a workspace (dir) for storing data and projects with this name.
-        project_name (str): Creates a project (dir) for storing configs and outputs with this name.
-        verbose (bool, optional): Whether to print out the progress. Defaults to False.
-    """
-
-    # Create full project path
     workspace_path = os.path.join(base_path, workspace_name)
     project_path = os.path.join(base_path, workspace_name, project_name)
     if os.path.exists(project_path):
@@ -123,7 +108,6 @@ def create_new_project(
         return
     os.makedirs(project_path)
 
-    # Create required directories
     required_directories = [
         os.path.join(workspace_path, "data"),
         os.path.join(project_path, "config"),
@@ -140,7 +124,6 @@ def create_new_project(
             print(f"Creating directory {directory}...")
         os.makedirs(directory, exist_ok=True)
 
-    # Populate default config
     with open(
         os.path.join(project_path, "config", f"{project_name}_config.py"), "w"
     ) as f:
@@ -149,75 +132,63 @@ def create_new_project(
 
 @dataclass
 class Config:
-    """Defines a configuration dataclass"""
-
-    input_path: str
-    compression_ratio: float
-    epochs: int
-    early_stopping: bool
-    early_stoppin_patience: int
-    lr_scheduler: bool
-    lr_scheduler_patience: int
-    min_delta: int
-    model_name: str
-    model_type = str
-    custom_norm: bool
-    l1: bool
-    reg_param: float
-    RHO: float
-    lr: float
-    batch_size: int
-    test_size: float
-    data_dimension: int
-    intermittent_model_saving: bool
-    separate_model_saving: bool
-    intermittent_saving_patience: int
-    mse_avg: bool
-    mse_sum: bool
-    emd: bool
-    l1: bool
-    deterministic_algorithm: bool
+    input_path: str = ""
+    compression_ratio: float = 2.0
+    epochs: int = 10
+    early_stopping: bool = True
+    early_stopping_patience: int = 100 # Fixed typo from 'stoppin'
+    lr_scheduler: bool = True
+    lr_scheduler_patience: int = 50
+    min_delta: float = 0.0
+    model_name: str = "AE"
+    model_type: str = "dense"
+    custom_norm: bool = False
+    l1: bool = True
+    reg_param: float = 0.001
+    RHO: float = 0.05
+    lr: float = 0.001
+    batch_size: int = 512
+    test_size: float = 0.2
+    data_dimension: int = 1
+    intermittent_model_saving: bool = False
+    separate_model_saving: bool = False
+    intermittent_saving_patience: int = 100
+    mse_avg: bool = False
+    mse_sum: bool = True
+    emd: bool = False
+    deterministic_algorithm: bool = True
+    # Extra fields for your ATLAS setup
+    save_error_bounded_deltas: bool = False
+    number_of_columns: int = 0
+    latent_space_size: int = 0
 
 
 def create_default_config(workspace_name: str, project_name: str) -> str:
-    """Creates a default config file for a project.
-    Args:
-        workspace_name (str): Name of the workspace.
-        project_name (str): Name of the project.
-    Returns:
-        str: Default config file.
-    """
-
     return f"""
 # === Configuration options ===
 
 def set_config(c):
-    c.input_path                   = "workspaces/{workspace_name}/data/{project_name}_data.npz"
-    c.data_dimension               = 1
-    c.compression_ratio            = 2.0
-    c.apply_normalization          = True
-    c.model_name                   = "AE"
-    c.model_type                    = "dense"
-    c.epochs                       = 5
-    c.lr                           = 0.001
-    c.batch_size                   = 512
-    c.early_stopping               = True
-    c.lr_scheduler                 = True
-
-
-
+    c.input_path                    = "workspaces/{workspace_name}/data/{project_name}_data.npz"
+    c.data_dimension                = 1
+    c.compression_ratio             = 2.0
+    c.apply_normalization           = True
+    c.model_name                    = "AE"
+    c.model_type                     = "dense"
+    c.epochs                        = 5
+    c.lr                            = 0.001
+    c.batch_size                    = 512
+    c.early_stopping                = True
+    c.lr_scheduler                  = True
 
 # === Additional configuration options ===
 
     c.early_stopping_patience      = 100
-    c.min_delta                    = 0
+    c.min_delta                     = 0
     c.lr_scheduler_patience        = 50
     c.custom_norm                  = False
     c.reg_param                    = 0.001
     c.RHO                          = 0.05
     c.test_size                    = 0
-    # c.number_of_columns            = 24
-    # c.latent_space_size            = 12
     c.extra_compression            = False
     c.intermittent_model_saving    = False
     c.intermittent_saving_patience = 100
@@ -228,51 +199,23 @@ def set_config(c):
     c.activation_extraction        = False
     c.deterministic_algorithm      = True
     c.separate_model_saving        = False
-
 """
 
 
 def model_init(model_name: str):
-    """Calls `data_processing.initialise_model`.
-
-    Args:
-        model_name (string): The name of the model you wish to initialize
-
-    Returns:
-       nn.Module : The initialized model
-    """
-    # This is used when we don't have saved model parameters.
     model_object = data_processing.initialise_model(model_name)
     return model_object
 
 
 def numpy_to_tensor(data):
-    """Converts ndarray to torch.Tensors.
-
-    Args:
-        data (ndarray): The data you wish to convert from ndarray to torch.Tensor.
-
-    Returns:
-        torch.Tensor: Your data as a tensor
-    """
     return torch.from_numpy(data)
 
 
 def normalize(data, custom_norm):
-    """Applies `data_processing.normalize()` along every axis of given data
-
-    Args:
-        data (ndarray): Data you wish to normalize
-        custom_norm (boolean): Wether or not you wish to use MinMax normalization
-
-    Returns:
-        ndarray: Normalized data
-    """
-    data = np.apply_along_axis(
-        data_processing.normalize, axis=0, arr=data, custom_norm=custom_norm
-    )
+    # Remove the np.apply_along_axis loop. 
+    # Just call the function once with the whole dataset.
+    data = data_processing.normalize(data, custom_norm=custom_norm)
     return data
-
 
 def process(
     input_path,
@@ -282,17 +225,6 @@ def process(
     convert_to_blocks,
     verbose,
 ):
-    """Loads the input data into a ndarray, splits it into train/test splits and normalizes if chosen.
-
-    Args:
-        input_path (string): Path to input data
-        custom_norm (boolean): `False` if you want to use MinMax normalization. `True` otherwise.
-        test_size (float): How much of your data to use as validation.
-        apply_normalization (boolean): `True` if you want to normalize. `False` if you don't want to normalize.
-
-    Returns: ndarray, ndarray, ndarray: Array with the train set, array with the test set and array with the
-    normalization features.
-    """
     loaded = np.load(input_path)
     data = loaded["data"]
 
@@ -320,174 +252,78 @@ def process(
 
 
 def renormalize(data, true_min_list, feature_range_list):
-    """Calls `data_processing.renormalize_func()`.
-
-    Args:
-        data (ndarray): Data you wish to un-normalize
-        true_min_list (ndarray): List of column minimums
-        feature_range_list (ndarray): List of column feature ranges
-
-    Returns:
-        ndarray: Un-normalized array
-    """
     return data_processing.renormalize_func(data, true_min_list, feature_range_list)
 
 
-def train(model, number_of_columns, train_set, test_set, project_path, config):
-    """Calls `training.train()`
-
-    Args:
-        model (modelObject): The model you wish to train
-        number_of_columns (int): Amount of columns in the initial dataset
-        train_set (ndarray): Array consisting of the train set
-        test_set (ndarray): Array consisting of the test set
-        project_path (string): Path to the project directory
-        config (dataClass): Base class selecting user inputs
-
-    Returns:
-        _type_: _description_
-    """
+def train(model, number_of_columns, train_set, test_set, project_path, config, tracker=None):
+    # IMPROVEMENT: tracker=None added to pass the EmissionTracker into the core loop
     return training.train(
-        model, number_of_columns, train_set, test_set, project_path, config
+        model, number_of_columns, train_set, test_set, project_path, config, tracker=tracker
     )
 
 
 def plotter(output_path, config):
-    """Calls `plotting.plot()`
-
-    Args:
-        output_path (string): Path to the output directory
-        config (dataClass): Base class selecting user inputs
-
-    """
-
     plotting.plot(output_path, config)
     print("=== Done ===")
     print("Your plots are available in:", os.path.join(output_path, "plotting"))
 
 
 def loss_plotter(path_to_loss_data, output_path, config):
-    """Calls `plotting.loss_plot()`
-
-    Args:
-        path_to_loss_data (string): Path to the values for the loss plot
-        output_path (string): Path to output the data
-        config (dataClass): Base class selecting user inputs
-
-    Returns:
-        .pdf file: Plot containing the loss curves
-    """
     return plotting.loss_plot(path_to_loss_data, output_path, config)
 
 
 def model_saver(model, model_path):
-    """Calls `data_processing.save_model()`
-
-    Args:
-        model (nn.Module): The PyTorch model to save.
-        model_path (str): String defining the models save path.
-
-    Returns:
-        .pt file: `.pt` File containing the model state dictionary
-    """
     return data_processing.save_model(model, model_path)
 
 
 def encoder_decoder_saver(model, encoder_path, decoder_path):
-    """Calls `data_processing.encoder_saver` and `data_processing.decoder_saver`
-
-    Args:
-        model (nn.Module): The PyTorch model to save.
-        model_path (str): String defining the models save path.
-
-    Returns:
-        .pt file: `.pt` File containing the encoder state dictionary
-        .pt file: `.pt` File containing the decoder state dictionary
-
-    """
     return data_processing.encoder_saver(
         model, encoder_path
     ), data_processing.decoder_saver(model, decoder_path)
 
 
 def detacher(tensor):
-    """Detaches a given tensor to ndarray
-
-    Args:
-        tensor (torch.Tensor): The PyTorch tensor one wants to convert to a ndarray
-
-    Returns:
-        ndarray: Converted torch.Tensor to ndarray
-    """
     return tensor.cpu().detach().numpy()
 
 
 def get_device():
-    """Returns the appropriate processing device. IF cuda is available it returns "cuda:0"
-        Otherwise it returns "cpu"
-
-    Returns:
-        _type_: Device string, either "cpu" or "cuda:0"
-    """
-    device = None
     if torch.cuda.is_available():
-        dev = "cuda:0"
-        device = torch.device(dev)
-    else:
-        dev = "cpu"
-        device = torch.device(dev)
-    return device
+        return torch.device("cuda:0")
+    return torch.device("cpu")
 
 
 def save_error_bounded_requirement(config, decoded_output, data_batch):
+    # Safe division to prevent RuntimeWarnings
+    epsilon = 1e-12
+    
     rms_pred_error = (
         np.divide(
             np.subtract(decoded_output, data_batch),
-            data_batch,
+            data_batch + epsilon,
         )
         * 100
     )
 
-    # Ignoring RMS Undefind Values because Ground Truth is Zero
-    rms_pred_error[
-        (rms_pred_error == np.inf)
-        | (rms_pred_error == -np.inf)
-        | (rms_pred_error == np.nan)
-    ] = 0.0
+    # Clean up non-finite results (inf, -inf, nan)
+    rms_pred_error[~np.isfinite(rms_pred_error)] = 0.0
+
     rms_pred_error_index = np.where(
         abs(rms_pred_error) > config.error_bounded_requirement
     )
     rows_idx, col_idx = rms_pred_error_index
+    deltas = []
     if len(rows_idx) > 0 and len(col_idx) > 0:
         rms_pred_error_exceeding_error_bound = np.subtract(
             decoded_output,
             data_batch,
             dtype=np.float16,
         )
-        deltas = []
         for i in range(len(rows_idx)):
             deltas.append(rms_pred_error_exceeding_error_bound[rows_idx[i]][col_idx[i]])
     return deltas, rms_pred_error_index
 
 
 def compress(model_path, config):
-    """Function which performs the compression of the input file. In order to compress, you must have a dataset whose
-    path is determined by `input_path` in the `config`. You also need a trained model from path `model_path`. The
-    model path is then used to initialize the model used for compression. The data is then converted into a
-    `torch.tensor` and then passed through `model.encode`.
-
-    Args:
-        model_path (string): Path to where the model is located
-        config (dataClass): Base class selecting user inputs
-
-    Raises:
-        NameError: Baler currently only supports 1D (e.g. HEP) or 2D (e.g. CFD) data as inputs.
-
-    Returns:
-        torch.Tensor: Compressed data as PyTorch tensor
-    """
-
-    # Loads the data and applies normalization if config.apply_normalization = True
     loaded = np.load(config.input_path)
     data_before = loaded["data"]
     original_shape = data_before.shape
@@ -502,15 +338,14 @@ def compress(model_path, config):
         data = normalize(data_before, config.custom_norm)
     else:
         data = data_before
+    
     number_of_columns = 0
     try:
         n_features = 0
         if config.data_dimension == 1:
             column_names = np.load(config.input_path)["names"]
             number_of_columns = len(column_names)
-            config.latent_space_size = ceil(
-                number_of_columns / config.compression_ratio
-            )
+            config.latent_space_size = ceil(number_of_columns / config.compression_ratio)
             config.number_of_columns = number_of_columns
             n_features = number_of_columns
         elif config.data_dimension == 2:
@@ -526,17 +361,11 @@ def compress(model_path, config):
                 (number_of_rows * config.number_of_columns) / config.compression_ratio
             )
         else:
-            raise NameError(
-                "Data dimension can only be 1 or 2. Got config.data_dimension = "
-                + str(config.data_dimension)
-            )
+            raise NameError(f"Data dimension can only be 1 or 2. Got {config.data_dimension}")
     except AttributeError:
         number_of_columns = config.number_of_columns
         latent_space_size = config.latent_space_size
-        print(f"{number_of_columns} -> {latent_space_size} dimensions")
 
-    # Initialise and load the model correctly.
-    latent_space_size = config.latent_space_size
     bs = config.batch_size
     device = get_device()
     model_object = data_processing.initialise_model(config.model_name)
@@ -564,288 +393,142 @@ def compress(model_path, config):
     elif config.data_dimension == 1:
         data_tensor = torch.tensor(data, dtype=torch.float64)
 
-    # Batching data to avoid memory leaks
-    data_dl = DataLoader(
-        data_tensor,
-        batch_size=bs,
-        shuffle=False,
-        drop_last=False,
-    )
+    data_dl = DataLoader(data_tensor, batch_size=bs, shuffle=False)
 
-    # Perform compression
-    error_bound_batch, error_bound_deltas, error_bound_index, compressed = (
-        [],
-        [],
-        [],
-        [],
-    )
+    error_bound_batch, error_bound_deltas, error_bound_index, compressed = [], [], [], []
 
     with torch.no_grad():
         for idx, data_batch in enumerate(tqdm(data_dl)):
             data_batch = data_batch.to(device)
-
             compressed_output = model.encode(data_batch)
 
             if config.save_error_bounded_deltas:
                 decoded_output = model.decode(compressed_output)
                 decoded_output = detacher(decoded_output)
-                deltas_compressed = 0
-            # Converting back to numpyarray
+            
             compressed_output = detacher(compressed_output)
             data_batch = detacher(data_batch)
 
             if config.save_error_bounded_deltas:
-                (
-                    deltas,
-                    rms_pred_error_index,
-                ) = save_error_bounded_requirement(config, decoded_output, data_batch)
-                if len(rms_pred_error_index) > 0:
+                deltas, rms_idx = save_error_bounded_requirement(config, decoded_output, data_batch)
+                if len(rms_idx[0]) > 0:
                     error_bound_batch.append(idx)
                     error_bound_deltas.append(deltas)
-                    error_bound_index.append(rms_pred_error_index)
-                    deltas_compressed += len(rms_pred_error_index[0])
+                    error_bound_index.append(rms_idx)
 
             if idx == 0:
                 compressed = compressed_output
             else:
                 compressed = np.concatenate((compressed, compressed_output))
 
-    if config.save_error_bounded_deltas:
-        print("Total Deltas Found - ", deltas_compressed)
-
     return (compressed, error_bound_batch, error_bound_deltas, error_bound_index)
 
 
-def decompress(
-    model_path,
-    input_path,
-    input_path_deltas,
-    input_batch_index,
-    model_name,
-    config,
-    output_path,
-    original_shape,
-):
-    """Function which performs the decompression of the compressed file. In order to decompress, you must have a
-    compressed file, whose path is determined by `input_path`, a model from path `model_path` and a model_name. The
-    model path and model names are used to initialize the model used for decompression. The data is then converted
-    into a `torch.tensor` and then passed through `model.decode`.
-
-    Args:
-        model_path (string): Path to where the model is located
-        input_path (string): Path to the data you want to decompress
-        model_name (string): Name of trained model from which you want to use decode
-        config (dataClass): Base class selecting user inputs
-
-    Returns: torch.tensor, ndarray, ndarray: decompressed data as tensor, ndarray of column names, ndarray of
-    normalization features
-    """
-
-    # Load the data & define necessary variables
+def decompress(model_path, input_path, input_path_deltas, input_batch_index, model_name, config, output_path, original_shape):
     loaded = np.load(input_path)
     data = loaded["data"]
     names = loaded["names"]
     normalization_features = loaded["normalization_features"]
 
     if config.model_type == "convolutional":
-        final_layer_details = np.load(
-            os.path.join(output_path, "training", "final_layer.npy"), allow_pickle=True
-        )
+        final_layer_details = np.load(os.path.join(output_path, "training", "final_layer.npy"), allow_pickle=True)
 
     if config.save_error_bounded_deltas:
-        loaded_deltas = np.load(
-            gzip.GzipFile(input_path_deltas, "r"), allow_pickle=True
-        )
-        loaded_batch_indexes = np.load(
-            gzip.GzipFile(input_batch_index, "r"), allow_pickle=True
-        )
-        error_bound_batch = loaded_batch_indexes[0]
-        error_bound_deltas = loaded_deltas
-        error_bound_index = loaded_batch_indexes[1]
-        deltas_added = 0
+        error_bound_batch = np.load(gzip.GzipFile(input_batch_index, "r"), allow_pickle=True)[0]
+        error_bound_deltas = np.load(gzip.GzipFile(input_path_deltas, "r"), allow_pickle=True)
+        error_bound_index = np.load(gzip.GzipFile(input_batch_index, "r"), allow_pickle=True)[1]
 
-    model_name = config.model_name
-    latent_space_size = len(data[0])
     bs = config.batch_size
-    model_dict = torch.load(str(model_path), map_location=get_device())
-    if config.data_dimension == 2 and config.model_type == "dense":
-        number_of_columns = int((len(model_dict[list(model_dict.keys())[-1]])))
-    else:
-        number_of_columns = len(model_dict[list(model_dict.keys())[-1]])
-
-    # Initialise and load the model correctly.
     device = get_device()
-    model_object = data_processing.initialise_model(model_name)
-    model = data_processing.load_model(
-        model_object,
-        model_path=model_path,
-        n_features=number_of_columns,
-        z_dim=latent_space_size,
-    )
+    model_dict = torch.load(str(model_path), map_location=device)
+    number_of_columns = len(model_dict[list(model_dict.keys())[-1]])
+
+    model_object = data_processing.initialise_model(config.model_name)
+    model = data_processing.load_model(model_object, model_path=model_path, n_features=number_of_columns, z_dim=len(data[0]))
     model.eval()
 
     if config.model_type == "convolutional":
         model.set_final_layer_dims(final_layer_details)
 
-    # Load the data, convert to tensor and batch it to avoid memory leaks
     data_tensor = torch.from_numpy(data).to(device)
-    data_dl = DataLoader(
-        data_tensor,
-        batch_size=bs,
-        shuffle=False,
-        drop_last=False,
-    )
+    data_dl = DataLoader(data_tensor, batch_size=bs, shuffle=False)
 
-    # Perform Decompression
     decompressed = []
     with torch.no_grad():
         for idx, data_batch in enumerate(tqdm(data_dl)):
-            data_batch = data_batch.to(device)
-
-            out = model.decode(data_batch).to(device)
-            # Converting back to numpyarray
-            out = detacher(out)
-            if config.save_error_bounded_deltas:
-                if idx in error_bound_batch:
-                    # Error Bounded Deltas added to Decompressed output
-                    delta_idx = np.where(error_bound_batch == idx)
-                    deltas = error_bound_deltas[delta_idx][0]
-                    delta_index = error_bound_index[delta_idx][0]
-                    row_idx, col_idx = delta_index
-
-                    for i in range(len(row_idx)):
-                        out[row_idx[i]][col_idx[i]] -= deltas[i]
-                        deltas_added += 1
+            out = detacher(model.decode(data_batch.to(device)))
+            
+            if config.save_error_bounded_deltas and idx in error_bound_batch:
+                delta_idx = np.where(error_bound_batch == idx)[0][0]
+                deltas = error_bound_deltas[delta_idx]
+                row_idx, col_idx = error_bound_index[delta_idx]
+                for i in range(len(row_idx)):
+                    out[row_idx[i]][col_idx[i]] -= deltas[i]
 
             if idx == 0:
                 decompressed = out
             else:
                 decompressed = np.concatenate((decompressed, out))
 
-    if config.save_error_bounded_deltas:
-        print("Total Deltas Added - ", deltas_added)
-
     if config.data_dimension == 2 and config.model_type == "dense":
-        decompressed = decompressed.reshape(
-            (len(decompressed), original_shape[1], original_shape[2])
-        )
+        decompressed = decompressed.reshape((len(decompressed), original_shape[1], original_shape[2]))
 
     return decompressed, names, normalization_features
 
 
 def diagnose(input_path: str, output_path: str) -> None:
-    """Calls diagnostics.diagnose()
-
-    Args:
-        input_path (str): path to the np.array contataining the activations values
-        output_path (str): path to store the diagnostics pdf
-    """
     diagnostics.diagnose(input_path, output_path)
 
 
 def perform_hls4ml_conversion(output_path, config):
-    """Function which performs the conversion of the model to FPGA architecture using hls4ml. In order to convert, you must have a trained model.
-
-    The output hls4ml project will be located in OutputDir defined in the config file.
-    The model path is determined by the `output_path`. The 'output_path' should point to the output directory inside the project directory.
-
-    Before running this function:
-    1. Install Vivado 2020.1 and add in to path.
-    2. Install hls4ml and tensorflow to the projects virtual environment.
-    3. Add the following configuration options to the projects config:
-
-        c.default_reuse_factor
-        c.default_precision
-        c.Strategy
-        c.Part
-        c.ClockPeriod
-        c.IOType
-        c.InputShape
-        c.ProjectName
-        c.OutputDir
-        c.InputData
-        c.OutputPredictions
-        c.csim
-        c.synth
-        c.cosim
-        c.export
-
-        This function was tested with the following configuration values:
-
-        c.default_reuse_factor         = 1
-        c.default_precision            = "ap_fixed<16,8>"
-        c.Strategy                     = "latency"
-        c.Part                         = "xcvu9p-flga2104-2L-e"
-        c.ClockPeriod                  = 5
-        c.IOType                       = "io_parallel"
-        c.InputShape                   = (1,16)
-        c.ProjectName                  = "tiny_test_model"
-        c.OutputDir                    = "workspaces/FPGA_compression_workspace/first_FPGA_Compression_project/output/hls4ml"
-        c.InputData                    = None
-        c.OutputPredictions            = None
-        c.csim                         = False
-        c.synth                        = True
-        c.cosim                        = False
-        c.export                       = False
-
-        Naming is based on the names used by hls4ml for easier reference. For more details please see hls4ml documentation.
-
-    4. The model to transform should be defined similarly to FPGA_prototype_model. Meaning:
-        a. Activations should be defined as layers and not functions.
-        b. If the model is defined as a class, each layer should be defined with an attribute. An attribute for the whole model instead of for each layer separately might cause errors in hls4ml compile function.
-        c. Not all types of layers are supported in hls4ml, check hls4ml for the supported layers.
-
-
-
-    Args:
-    output_path (string): Path to the output directory inside the project directory.
-    config (dataClass): Base class selecting user inputs
-
-    Returns: None
-
-
-    """
-
     import hls4ml
-
     model_path = os.path.join(output_path, "compressed_output", "model.pt")
-
     model_object = data_processing.initialise_model(config.model_name)
-    model = data_processing.load_model(
-        model_object,
-        model_path=model_path,
-        n_features=config.number_of_columns,
-        z_dim=config.latent_space_size,
-    )
+    model = data_processing.load_model(model_object, model_path=model_path, n_features=config.number_of_columns, z_dim=config.latent_space_size)
     model.to("cpu")
 
-    hls_config = hls4ml.utils.config_from_pytorch_model(
-        model,
-        granularity="name",
-        default_reuse_factor=config.default_reuse_factor,
-        default_precision=config.default_precision,
-    )
-
+    hls_config = hls4ml.utils.config_from_pytorch_model(model, granularity="name", default_reuse_factor=config.default_reuse_factor, default_precision=config.default_precision)
     hls_config["Model"]["Strategy"] = config.Strategy
 
     cfg = hls4ml.converters.create_config(backend="Vivado")
-    cfg["Part"] = config.Part
-    cfg["ClockPeriod"] = config.ClockPeriod
-    cfg["IOType"] = config.IOType
-    cfg["HLSConfig"] = hls_config
-    cfg["PytorchModel"] = model
-    cfg["InputShape"] = config.InputShape
-    cfg["OutputDir"] = config.OutputDir
-
-    if config.InputData and config.OutputPredictions:
-        cfg["InputData"] = config.InputData
-        cfg["OutputPredictions"] = config.OutputPredictions
+    cfg["Part"], cfg["ClockPeriod"], cfg["IOType"], cfg["HLSConfig"], cfg["PytorchModel"], cfg["InputShape"], cfg["OutputDir"] = config.Part, config.ClockPeriod, config.IOType, hls_config, model, config.InputShape, config.OutputDir
 
     hls_model = hls4ml.converters.pytorch_to_hls(cfg)
-    hls_model.config.config["ProjectName"] = config.ProjectName
-
     hls_model.compile()
+    hls_model.build(csim=config.csim, synth=config.synth, cosim=config.cosim, export=config.export)
+    
+    
+   #function to create a csv to collect metrics during each process(Training, compress and decompress)
+def add_to_performance_log(path, metrics_dict, file_name="training_metrics.csv"):
+    """
+    Appends a dictionary of metrics as a new row in a CSV file using the csv module.
+    """
+    csv_path = os.path.join(path, file_name)
+    file_exists = os.path.isfile(csv_path)
 
-    hls_model.build(
-        csim=config.csim, synth=config.synth, cosim=config.cosim, export=config.export
-    )
+    # Extract headers (keys) and values from the dictionary
+    headers = list(metrics_dict.keys())
+    values = list(metrics_dict.values())
+
+    # Open in 'a' (append) mode
+    with open(csv_path, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        
+        # If the file is brand new, write the header row first
+        if not file_exists:
+            writer.writerow(headers)
+        
+        # Write the actual data row
+        writer.writerow(values)
+
+    print(f"Metrics successfully logged to {csv_path}")
+    
+ #Get the power limit of the laptop
+#It would help for Green AI comparison
+def get_cpu_power_limit():
+    try:
+        with open("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw", "r") as f:
+            uw = int(f.read().strip())
+            return uw / 1_000_000  # Convert to Watts
+    except FileNotFoundError:
+        return 45.0
