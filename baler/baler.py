@@ -14,14 +14,15 @@
 
 import os
 import time
+from thop import profile
 from math import ceil
-
 import numpy as np
-
-from .modules import helper
+import torch
+import csv
 import gzip
+from .modules import helper, clean
 from .modules.profiling import pytorch_profile
-
+from thop import profile
 
 __all__ = (
     "perform_compression",
@@ -33,27 +34,11 @@ __all__ = (
 )
 
 
+# -------------------------
+# Main Entry
+# -------------------------
 def main():
-    """Calls different functions depending on argument parsed in command line.
-
-        - if --mode=newProject: call `helper.create_new_project` and create a new project sub directory with config file
-        - if --mode=train: call `perform_training` and train the network on given data and based on the config file and check if profilers are enabled
-        - if --mode=compress: call `perform_compression` and compress the given data using the model trained in `--mode=train`
-        - if --mode=decompress: call `perform_decompression` and decompress the compressed file outputted from `--mode=compress`
-        - if --mode=plot: call `perform_plotting` and plot the comparison between the original data and the decompressed data from `--mode=decompress`. Also plots the loss plot from the trained network.
-        - if --mode=convert_with_hls4ml: call `helper.perform_hls4ml_conversion` and create an hls4ml project containing the converted model.
-
-
-    Raises:
-        NameError: Raises error if the chosen mode does not exist.
-    """
-    (
-        config,
-        mode,
-        workspace_name,
-        project_name,
-        verbose,
-    ) = helper.get_arguments()
+    config, mode, workspace_name, project_name, verbose = helper.get_arguments()
     project_path = os.path.join("workspaces", workspace_name, project_name)
     output_path = os.path.join(project_path, "output")
 
@@ -71,16 +56,17 @@ def main():
         perform_plotting(output_path, config, verbose)
     elif mode == "info":
         print_info(output_path, config)
+    elif mode == "clean":
+        clean.clean(config)
     elif mode == "convert_with_hls4ml":
         helper.perform_hls4ml_conversion(output_path, config)
     else:
-        raise NameError(
-            "Baler mode "
-            + mode
-            + " not recognised. Use baler --help to see available modes."
-        )
+        raise NameError(f"Baler mode {mode} not recognised. Use baler --help to see available modes.")
 
 
+# -------------------------
+# Training
+# -------------------------
 def perform_training(output_path, config, verbose: bool):
     """Main function calling the training functions, ran when --mode=train is selected.
         The three functions called are: `helper.process`, `helper.mode_init` and `helper.training`.
@@ -95,6 +81,36 @@ def perform_training(output_path, config, verbose: bool):
     Raises:
         NameError: Baler currently only supports 1D (e.g. HEP) or 2D (e.g. CFD) data as inputs.
     """
+    import warnings
+    import logging
+    import os
+    import time
+    import torch
+    import numpy as np
+    from math import ceil
+    from thop import profile
+
+    # Silence warnings and CodeCarbon INFO logs
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    logging.getLogger("codecarbon").setLevel(logging.ERROR)
+    
+    from codecarbon import EmissionsTracker
+    training_path = os.path.join(output_path, "training")
+    
+    # Initialize tracker with high resolution (1s)
+    tracker = EmissionsTracker(
+        measure_power_secs=1,
+        api_call_interval=1,
+        project_name="Baler_Training",
+        output_dir=training_path,
+        output_file="emission_training.csv",
+        save_to_file=True,
+        tracking_mode='machine', 
+    )
+
+    #  START TRACKING ---
+    tracker.start()
+
     (
         train_set_norm,
         test_set_norm,
@@ -166,27 +182,99 @@ def perform_training(output_path, config, verbose: bool):
 
     if verbose:
         print(f"Model architecture:\n{model}")
+    
+    model.eval()
+    dummy_input = torch.randn(1, n_features).to(device).float()
+    macs, params = profile(model, inputs=(dummy_input,), verbose=False)
+    flops = macs * 2 
+    
+    # PRINT
+    print("\n" + "-"*60)
+    print(f"{'Layer Name':<30} | {'MACs':<12} | {'Parameters':<12}")
+    print("-"*60)
+    for name, module in model.named_modules():
+        if hasattr(module, 'total_ops') and module.total_ops > 0:
+            m_macs = int(module.total_ops)
+            m_params = sum(p.numel() for p in module.parameters())
+            print(f"{name:<30} | {m_macs:<12,} | {m_params:<12,}")
+    print("-"*60 + "\n")
 
-    training_path = os.path.join(output_path, "training")
-    if verbose:
-        print(f"Training path: {training_path}")
+    model.train()
+
+    # --- START PROFILING ---
+    start_wall = time.time()
+    start_perf = time.perf_counter()
+    start_cpu = time.process_time()
 
     trained_model = helper.train(
-        model, number_of_columns, train_set_norm, test_set_norm, training_path, config
+        model, number_of_columns, train_set_norm, test_set_norm, training_path, config, tracker=tracker
     )
 
-    if verbose:
-        print("Training complete")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    #  STOP TRACKING & PROFILING 
+    end_wall = time.time()
+    end_perf = time.perf_counter()
+    end_cpu = time.process_time()
+    
+    tracker.stop()
+
+    wall_diff = end_wall - start_wall
+    perf_diff = end_perf - start_perf
+    cpu_diff = end_cpu - start_cpu
+
+    if torch.cuda.is_available():
+        avg_power_w = 45.0 
+    else:
+        avg_power_w = helper.get_cpu_power_limit()
+        
+    energy_joules = avg_power_w * wall_diff
+    total_gflops = (flops * len(train_set_norm) * config.epochs) / 1e9
+
+    try:
+        loss_history = np.load(os.path.join(training_path, "loss_data.npy"))
+        val_loss_row = loss_history[1]
+        best_index = np.argmin(val_loss_row)
+        best_val_loss = val_loss_row[best_index]
+        best_epoch = int(best_index + 1)
+    except Exception as e:
+        best_epoch, best_val_loss = "N/A", "N/A"
+
+    #  PRINTING ---
+    print("\n" + "="*50)
+    print("TRAINING PERFORMANCE SUMMARY")
+    print(f"1. Wall-Clock (time.time):      {wall_diff:.4f}s")
+    print(f"2. Perf Counter (True-Walltime):         {perf_diff:.4f}s")
+    print(f"3. Process Time (CPU):   {cpu_diff:.4f}s")
+    print("-" * 50)
+    print(f"Model MACs:               {int(macs)}")
+    print(f"Model FLOPs:              {int(flops)}")
+    print(f"Estimated Energy:         {energy_joules:.2f} Joules (@{avg_power_w}W)")
+    print(f"Total Training GFLOPs:   {total_gflops:.4f}")
+    print("-" * 50)
+    print(f"Best Training Epoch:      {best_epoch}")
+    print(f"Lowest Validation Loss:  {best_val_loss:.6e}")
+    print("="*50 + "\n")
+
+    metrics = {
+        "seed": getattr(config, "seed", "N/A"),
+        "mode": "train",
+        "wall_time_sec": round(wall_diff, 4),
+        "perf_time_sec": round(perf_diff, 4),
+        "cpu_time_sec": round(cpu_diff, 4),
+        "MACs": int(macs),
+        "FLOPs": int(flops),
+        "Power_Watts": avg_power_w,
+        "Energy_Joules": round(energy_joules, 4),
+        "Total_GFLOPs": round(total_gflops, 4),
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss
+    }
+    helper.add_to_performance_log(os.path.join(output_path, "training"), metrics, file_name="training_metrics.csv")
 
     if config.apply_normalization:
-        np.save(
-            os.path.join(training_path, "normalization_features.npy"),
-            normalization_features,
-        )
-        if verbose:
-            print(
-                f"Normalization features saved to {os.path.join(training_path, 'normalization_features.npy')}"
-            )
+        np.save(os.path.join(training_path, "normalization_features.npy"), normalization_features)
 
     if config.separate_model_saving:
         helper.encoder_decoder_saver(
@@ -195,53 +283,18 @@ def perform_training(output_path, config, verbose: bool):
             os.path.join(output_path, "compressed_output", "decoder.pt"),
         )
     else:
-        helper.model_saver(
-            trained_model, os.path.join(output_path, "compressed_output", "model.pt")
-        )
-    if verbose:
-        print(
-            f"Model saved to {os.path.join(output_path, 'compressed_output', 'model.pt')}"
-        )
+        helper.model_saver(trained_model, os.path.join(output_path, "compressed_output", "model.pt"))
 
-        print("\nThe model has the following structure:")
-        print(model.type)
-
-
-def perform_diagnostics(project_path, verbose: bool):
-    output_path = os.path.join(project_path, "plotting")
-    if verbose:
-        print("Performing diagnostics")
-        print(f"Saving plots to {output_path}")
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-    input_path = os.path.join(project_path, "training", "activations.npy")
-    helper.diagnose(input_path, output_path)
-
-
-def perform_plotting(output_path, config, verbose: bool):
-    """Main function calling the two plotting functions, ran when --mode=plot is selected.
-       The two main functions this calls are: `helper.plotter` and `helper.loss_plotter`
-
-    Args:
-        output_path (string): Selects base path for determining output path
-        config (dataClass): Base class selecting user inputs
-        verbose (bool): If True, prints out more information
-    """
-    if verbose:
-        print("Plotting...")
-        print(f"Saving plots to {output_path}")
-    helper.loss_plotter(
-        os.path.join(output_path, "training", "loss_data.npy"), output_path, config
-    )
-    helper.plotter(output_path, config)
-
+# -------------------------
+# Compress
+# -------------------------
 
 def perform_compression(output_path, config, verbose: bool):
     """Main function calling the compression functions, ran when --mode=compress is selected.
-       The main function being called here is: `helper.compress`
+        The main function being called here is: `helper.compress`
 
-        If `config.extra_compression` is selected, the compressed file is further compressed via zip
-        Else, the function returns a compressed file of `.npz`, only compressed by Baler.
+         If `config.extra_compression` is selected, the compressed file is further compressed via zip
+         Else, the function returns a compressed file of `.npz`, only compressed by Baler.
 
     Args:
         output_path (path): Selects base path for determining output path
@@ -255,13 +308,53 @@ def perform_compression(output_path, config, verbose: bool):
         - Normalization features if `config.apply_normalization=True`
     """
     print("Compressing...")
-    start = time.time()
     normalization_features = []
 
     if config.apply_normalization:
         normalization_features = np.load(
             os.path.join(output_path, "training", "normalization_features.npy")
         )
+
+    # COMPUTE COMPRESSION COMPLEXITY (MACs/FLOPs) ---
+    from thop import profile
+    device = helper.get_device()
+    
+    # Identify the model path to load for profiling
+    path_to_model = os.path.join(output_path, "compressed_output", "encoder.pt" if config.separate_model_saving else "model.pt")
+    
+    # load the model architecture to profile it
+    model_object = helper.model_init(config.model_name)
+    #use the config number of columns for the input size
+    model = model_object(n_features=config.number_of_columns, z_dim=config.latent_space_size)
+    model.to(device)
+    model.eval()
+
+    # Create dummy input based on feature size
+    dummy_input = torch.randn(1, config.number_of_columns).to(device).float()
+    
+    # Profile the Encoder
+    # During compression, only the 'encoder' part is  doing the work.
+    macs, params = profile(model, inputs=(dummy_input,), verbose=False)
+    flops = macs * 2 
+    
+    # START PROFILING ---
+    start_wall = time.time()          # System time
+    start_perf = time.perf_counter()  # High-res true wall time
+    start_cpu  = time.process_time()  # CPU work time
+
+    # CARBON TRACKER FOR COMPRESSION ---
+    from codecarbon import OfflineEmissionsTracker
+    # measure_power_secs=1 ensures it logs every second for the time-series data
+    tracker = OfflineEmissionsTracker(
+        project_name="compression",
+        output_dir=os.path.join(output_path, "compressed_output"),
+        output_file="emission_compression.csv",
+        country_iso_code="ZAF",# South Africa
+        measure_power_secs=1,
+        log_level="error",
+    )
+    tracker.start()
+
     if config.separate_model_saving:
         (
             compressed,
@@ -283,10 +376,70 @@ def perform_compression(output_path, config, verbose: bool):
             config=config,
         )
 
-    end = time.time()
+    # Ensure GPU tasks are finished before stopping the clocks
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-    print("Compression took:", f"{(end - start) / 60:.3} minutes")
+    # STOP CARBON TRACKER ---
+    tracker.stop()
 
+    # STOP TRIPLE PROFILING ---
+    end_wall = time.time()
+    end_perf = time.perf_counter()
+    end_cpu  = time.process_time()
+
+    # CALCULATIONS ---
+    wall_diff = end_wall - start_wall
+    perf_diff = end_perf - start_perf
+    cpu_diff  = end_cpu - start_cpu
+
+    # Power and Energy 
+    if torch.cuda.is_available():
+        avg_power_w = 45.0
+    else:
+        avg_power_w = helper.get_cpu_power_limit()
+        
+    energy_joules = avg_power_w * wall_diff
+    
+    # Total work for compression is (FLOPs per sample * Total samples in the file)
+    # This represents the computational footprint of compressing this specific file
+    total_compression_gflops = (flops * len(compressed)) / 1e9
+
+    # Printing results as requested
+    print("\n" + "="*40)
+    print("COMPRESSION PERFORMANCE SUMMARY")
+    print(f"1. Wall-Clock (time.time):      {wall_diff:.4f}s")
+    print(f"2. Perf Counter (True-Walltime):    {perf_diff:.4f}s")
+    print(f"3. Process Time (CPU work):     {cpu_diff:.4f}s")
+    print("-" * 40)
+    print(f"Inference MACs:                 {int(macs)}")
+    print(f"Inference FLOPs:                {int(flops)}")
+    print(f"Compression Energy:             {energy_joules:.4f} Joules")
+    print(f"Total Compression GFLOPs:       {total_compression_gflops:.6f}")
+    print("="*40 + "\n")
+
+    # Metrics for CSV logging - Saved in compressed_output folder
+    metrics = {
+        "seed": getattr(config, "seed", "N/A"),
+        "mode": "compress",
+        "wall_time_sec": round(wall_diff, 4),
+        "perf_time_sec": round(perf_diff, 4),
+        "cpu_time_sec": round(cpu_diff, 4),
+        "MACs": int(macs),
+        "FLOPs": int(flops),
+        "Power_Watts": avg_power_w,
+        "Energy_Joules": round(energy_joules, 4),
+        "Total_GFLOPs": round(total_compression_gflops, 6)
+    }
+    
+    # Save specifically to compress_metrics.csv in the compressed_output folder
+    helper.add_to_performance_log(
+        os.path.join(output_path, "compressed_output"), 
+        metrics, 
+        file_name="compress_metrics.csv"
+    )
+
+    # SAVING
     names = np.load(config.input_path)["names"]
 
     if config.extra_compression:
@@ -313,7 +466,9 @@ def perform_compression(output_path, config, verbose: bool):
             names=names,
             normalization_features=normalization_features,
         )
+
     if config.save_error_bounded_deltas:
+        # FIX: Added dtype=object to fix VisibleDeprecationWarning for ragged sequences
         error_bound_batch_index = np.array(
             [error_bound_batch, error_bound_index], dtype=object
         )
@@ -329,7 +484,8 @@ def perform_compression(output_path, config, verbose: bool):
             os.path.join(output_path, "compressed_output", "compressed_deltas.npz.gz"),
             "w",
         )
-        np.save(file=f_deltas, arr=error_bound_deltas)
+        # Added np.asanyarray with dtype=object to ensure clean saving of deltas
+        np.save(file=f_deltas, arr=np.array(error_bound_deltas, dtype=object))
         np.save(
             file=f_batch_index,
             arr=error_bound_batch_index,
@@ -338,9 +494,12 @@ def perform_compression(output_path, config, verbose: bool):
         f_deltas.close()
 
 
+# ----------------------------------------------------------------------
+# Decompression
+# -------------------------
 def perform_decompression(output_path, config, verbose: bool):
     """Main function calling the decompression functions, ran when --mode=decompress is selected.
-       The main function being called here is: `helper.decompress`
+        The main function being called here is: `helper.decompress`
 
         If `config.apply_normalization=True` the output is un-normalized with the same normalization features saved from `perform_training()`.
 
@@ -349,162 +508,252 @@ def perform_decompression(output_path, config, verbose: bool):
         config (dataClass): Base class selecting user inputs
         verbose (bool): If True, prints out more information
     """
-    print("Decompressing...")
-
-    start = time.time()
-    model_name = config.model_name
-    data_before = np.load(config.input_path)["data"]
-    if config.separate_model_saving:
-        decompressed, names, normalization_features = helper.decompress(
-            model_path=os.path.join(output_path, "compressed_output", "decoder.pt"),
-            input_path=os.path.join(output_path, "compressed_output", "compressed.npz"),
-            input_path_deltas=os.path.join(
-                output_path, "compressed_output", "compressed_deltas.npz.gz"
-            ),
-            input_batch_index=os.path.join(
-                output_path,
-                "compressed_output",
-                "compressed_batch_index_metadata.npz.gz",
-            ),
-            model_name=model_name,
-            config=config,
-            output_path=output_path,
-            original_shape=data_before.shape,
-        )
-    else:
-        decompressed, names, normalization_features = helper.decompress(
-            model_path=os.path.join(output_path, "compressed_output", "model.pt"),
-            input_path=os.path.join(output_path, "compressed_output", "compressed.npz"),
-            input_path_deltas=os.path.join(
-                output_path, "compressed_output", "compressed_deltas.npz.gz"
-            ),
-            input_batch_index=os.path.join(
-                output_path,
-                "compressed_output",
-                "compressed_batch_index_metadata.npz.gz",
-            ),
-            model_name=model_name,
-            config=config,
-            output_path=output_path,
-            original_shape=data_before.shape,
-        )
-    if verbose:
-        print(f"Model used: {model_name}")
-
-    if hasattr(config, "convert_to_blocks") and config.convert_to_blocks:
-        print(
-            "Converting Blocked Data into Standard Format. Old Shape - ",
-            decompressed.shape,
-            "Target Shape - ",
-            data_before.shape,
-        )
-        if config.model_type == "dense":
-            decompressed = decompressed.reshape(
-                data_before.shape[0], data_before.shape[1], data_before.shape[2]
-            )
-        else:
-            decompressed = decompressed.reshape(
-                data_before.shape[0], 1, data_before.shape[1], data_before.shape[2]
-            )
-
-    if config.apply_normalization:
-        print("Un-normalizing...")
-        normalization_features = np.load(
-            os.path.join(output_path, "training", "normalization_features.npy"),
-        )
-        if verbose:
-            print(
-                f"Normalization features loaded from {os.path.join(output_path, 'training', 'normalization_features.npy')}"
-            )
-
-        decompressed = helper.renormalize(
-            decompressed,
-            normalization_features[0],
-            normalization_features[1],
-        )
+    
+    import warnings
+    import logging
+    # Silence Deprecation/Future warnings and CodeCarbon INFO logs
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    logging.getLogger("codecarbon").setLevel(logging.ERROR)
+    
+    from codecarbon import EmissionsTracker
+    log_dir = os.path.join(output_path, "decompressed_output")
+    
+    tracker = EmissionsTracker(
+        measure_power_secs=1,
+        project_name="Baler_Decompression",
+        output_dir=log_dir,
+        output_file="emission_decompression.csv",
+        save_to_file=True,
+    )
+    tracker.start()
 
     try:
-        if verbose:
-            print("Converting to original data types")
-        type_list = config.type_list
-        decompressed = np.transpose(decompressed)
-        for index, column in enumerate(decompressed):
-            decompressed[index] = decompressed[index].astype(type_list[index])
-        decompressed = np.transpose(decompressed)
-    except AttributeError:
-        pass
+        print("Decompressing with Triple Profiling...")
 
-    end = time.time()
-    print("Decompression took:", f"{(end - start) / 60:.3} minutes")
+       
+        model_name = config.model_name
+        data_before = np.load(config.input_path)["data"]
 
-    if config.extra_compression:
-        if verbose:
-            print("Extra compression selected")
-            print(
-                f"Saving decompressed file to {os.path.join(output_path, 'decompressed_output', 'decompressed.npz')}"
+        # COMPUTE DECOMPRESSION COMPLEXITY (MACs/FLOPs) ---
+        from thop import profile
+        device = helper.get_device()
+        
+        # load the model architecture to profile the decoder part
+        model_object = helper.model_init(config.model_name)
+        # Decoder takes the latent_space_size as input and outputs original number_of_columns
+        model = model_object(n_features=config.number_of_columns, z_dim=config.latent_space_size)
+        model.to(device)
+        model.eval()
+
+        # Create dummy input based on the latent space size (the input to the decoder)
+        dummy_input = torch.randn(1, config.latent_space_size).to(device).float()
+        
+        
+        class DecoderWrapper(torch.nn.Module):
+            def __init__(self, decode_func):
+                super().__init__()
+                self.decode_func = decode_func
+            def forward(self, x):
+                return self.decode_func(x)
+
+        # Try profiling the decoder
+        try:
+            
+            target = getattr(model, 'decoder', getattr(model, 'dec', model))
+            macs, params = profile(target, inputs=(dummy_input,), verbose=False)
+            
+            
+            if macs == 0:
+                decoder_module = DecoderWrapper(model.decode)
+                macs, params = profile(decoder_module, inputs=(dummy_input,), verbose=False)
+        except Exception:
+            macs, params = 0, 0
+            
+        flops = macs * 2 
+
+        # START PROFILING ---
+        start_wall = time.time()          # System/Wall clock
+        start_perf = time.perf_counter()  # High-resolution true wall time
+        start_cpu  = time.process_time()  # Pure CPU execution time
+
+        if config.separate_model_saving:
+            decompressed, names, normalization_features = helper.decompress(
+                model_path=os.path.join(output_path, "compressed_output", "decoder.pt"),
+                input_path=os.path.join(output_path, "compressed_output", "compressed.npz"),
+                input_path_deltas=os.path.join(
+                    output_path, "compressed_output", "compressed_deltas.npz.gz"
+                ),
+                input_batch_index=os.path.join(
+                    output_path,
+                    "compressed_output",
+                    "compressed_batch_index_metadata.npz.gz",
+                ),
+                model_name=model_name,
+                config=config,
+                output_path=output_path,
+                original_shape=data_before.shape,
             )
-        np.savez_compressed(
-            os.path.join(output_path, "decompressed_output", "decompressed.npz"),
-            data=decompressed,
-            names=names,
+        else:
+            decompressed, names, normalization_features = helper.decompress(
+                model_path=os.path.join(output_path, "compressed_output", "model.pt"),
+                input_path=os.path.join(output_path, "compressed_output", "compressed.npz"),
+                input_path_deltas=os.path.join(
+                    output_path, "compressed_output", "compressed_deltas.npz.gz"
+                ),
+                input_batch_index=os.path.join(
+                    output_path,
+                    "compressed_output",
+                    "compressed_batch_index_metadata.npz.gz",
+                ),
+                model_name=model_name,
+                config=config,
+                output_path=output_path,
+                original_shape=data_before.shape,
+            )
+        
+        if verbose:
+            print(f"Model used: {model_name}")
+
+        if hasattr(config, "convert_to_blocks") and config.convert_to_blocks:
+            if config.model_type == "dense":
+                decompressed = decompressed.reshape(
+                    data_before.shape[0], data_before.shape[1], data_before.shape[2]
+                )
+            else:
+                decompressed = decompressed.reshape(
+                    data_before.shape[0], 1, data_before.shape[1], data_before.shape[2]
+                )
+
+        if config.apply_normalization:
+            normalization_features = np.load(
+                os.path.join(output_path, "training", "normalization_features.npy"),
+            )
+            decompressed = helper.renormalize(
+                decompressed,
+                normalization_features[0],
+                normalization_features[1],
+            )
+
+        try:
+            type_list = config.type_list
+            decompressed = np.transpose(decompressed)
+            for index, column in enumerate(decompressed):
+                decompressed[index] = decompressed[index].astype(type_list[index])
+            decompressed = np.transpose(decompressed)
+        except AttributeError:
+            pass
+
+        # Ensure all hardware tasks (like GPU kernels) are finished
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        #  STOP  PROFILING ---
+        end_wall = time.time()
+        end_perf = time.perf_counter()
+        end_cpu  = time.process_time()
+
+        # CALCULATIONS ---
+        wall_diff = end_wall - start_wall
+        perf_diff = end_perf - start_perf
+        cpu_diff  = end_cpu - start_cpu
+        distortion_mse = np.mean((data_before - decompressed) ** 2)
+
+        # Power and Energy (Using dynamic hardware check)
+        if torch.cuda.is_available():
+            avg_power_w = 45.0
+        else:
+            avg_power_w = helper.get_cpu_power_limit()
+            
+        energy_joules = avg_power_w * wall_diff
+        
+        # Total work for decompression (FLOPs per sample * Total samples)
+        total_decompress_gflops = (flops * len(decompressed)) / 1e9
+
+        # Print results to terminal with requested formatting
+        print("\n" + "="*40)
+        print("DECOMPRESSION PERFORMANCE SUMMARY")
+        print(f"1. Wall-Clock (time.time):      {wall_diff:.4f}s")
+        print(f"2. Perf Counter (True-Walltime):    {perf_diff:.4f}s")
+        print(f"3. Process Time (CPU work):     {cpu_diff:.4f}s")
+        print("-" * 40)
+        print(f"Inference MACs:                 {int(macs)}")
+        print(f"Inference FLOPs:                {int(flops)}")
+        print(f"Decompression Energy:           {energy_joules:.4f} Joules")
+        print(f"Total Decompress GFLOPs:        {total_decompress_gflops:.6f}")
+        print(f"Distortion (MSE):               {distortion_mse:.6e}")
+        print("="*40 + "\n")
+
+        # Logging metrics to the specific decompression_metrics.csv
+        metrics = {
+            "seed": getattr(config, "seed", "N/A"),
+            "mode": "decompress",
+            "wall_time_sec": round(wall_diff, 4),
+            "perf_time_sec": round(perf_diff, 4),
+            "cpu_time_sec": round(cpu_diff, 4),
+            "MACs": int(macs),
+            "FLOPs": int(flops),
+            "Power_Watts": avg_power_w,
+            "Energy_Joules": round(energy_joules, 4),
+            "Total_GFLOPs": round(total_decompress_gflops, 6),
+            "distortion_mse": distortion_mse
+        }
+        
+        # Saved in decompression_output as requested
+        helper.add_to_performance_log(
+            os.path.join(output_path, "decompressed_output"), 
+            metrics, 
+            file_name="decompression_metrics.csv"
         )
-    else:
-        np.savez(
-            os.path.join(output_path, "decompressed_output", "decompressed.npz"),
-            data=decompressed,
-            names=names,
-        )
+
+        #  SAVING  ---
+        if config.extra_compression:
+            np.savez_compressed(
+                os.path.join(output_path, "decompressed_output", "decompressed.npz"),
+                data=decompressed,
+                names=names,
+            )
+        else:
+            np.savez(
+                os.path.join(output_path, "decompressed_output", "decompressed.npz"),
+                data=decompressed,
+                names=names,
+            )
+            
+    finally:
+        # Stop tracking and output final emissions report
+        emissions_kg = tracker.stop()
+        if verbose:
+            print(f"Decompression Carbon Footprint: {emissions_kg:.6f} kg CO2")
+            
+            
+            
+            
+            
+            
+# -------------------------
+# Diagnostics / Plotting / Info
+# -------------------------
+def perform_diagnostics(project_path, verbose: bool):
+    output_path = os.path.join(project_path, "plotting")
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    input_path = os.path.join(project_path, "training", "activations.npy")
+    helper.diagnose(input_path, output_path)
+
+
+def perform_plotting(output_path, config, verbose: bool):
+    helper.loss_plotter(os.path.join(output_path, "training", "loss_data.npy"), output_path, config)
+    helper.plotter(output_path, config)
 
 
 def print_info(output_path, config):
-    """Function which prints information about your total compression ratios and the file sizes.
-
-    Args:meta_data
-        output_path (string): Selects path to project from which one wants to obtain file information
-        config (dataClass): Base class selecting user inputs
-    """
-    print(
-        "================================== \n Information about your compression \n================================== "
-    )
-
+    print("### Compression Information ###")
     original = config.input_path
-    compressed_path = os.path.join(output_path, "compressed_output")
-    decompressed_path = os.path.join(output_path, "decompressed_output")
-    training_path = os.path.join(output_path, "training")
+    compressed = os.path.join(output_path, "compressed_output", "compressed.npz")
 
-    model = os.path.join(compressed_path, "model.pt")
-    compressed = os.path.join(compressed_path, "compressed.npz")
-    decompressed = os.path.join(decompressed_path, "decompressed.npz")
+    orig_size = os.stat(original).st_size / (1024 * 1024)
+    comp_size = os.stat(compressed).st_size / (1024 * 1024)
 
-    meta_data = [
-        model,
-        os.path.join(training_path, "loss_data.npy"),
-        os.path.join(training_path, "normalization_features.npy"),
-    ]
-
-    meta_data_stats = [
-        os.stat(meta_data[file]).st_size / (1024 * 1024)
-        for file in range(len(meta_data))
-    ]
-
-    files = [original, compressed, decompressed]
-    file_stats = [
-        os.stat(files[file]).st_size / (1024 * 1024) for file in range(len(files))
-    ]
-
-    print(
-        f"\nCompressed file is {round(file_stats[1] / file_stats[0], 4) * 100}% the size of the original\n"
-    )
-    print(f"File size before compression: {round(file_stats[0], 4)} MB\n")
-    print(f"Compressed file size: {round(file_stats[1], 4)} MB\n")
-    print(f"De-compressed file size: {round(file_stats[2], 4)} MB\n")
-    print(f"Compression ratio: {round(file_stats[0] / file_stats[1], 4)}\n")
-    print(
-        f"The meta-data saved has a total size of: {round(sum(meta_data_stats),4)} MB\n"
-    )
-    print(
-        f"Combined, the actual compression ratio is: {round((file_stats[0])/(file_stats[1] + sum(meta_data_stats)),4)}"
-    )
-    print("\n ==================================")
-
-    ## TODO: Add way to print how much your data has been distorted
+    print(f"Original Size: {orig_size:.4f} MB")
+    print(f"Compressed Size: {comp_size:.4f} MB")
+    print(f"Ratio: {orig_size / comp_size:.4f}")
