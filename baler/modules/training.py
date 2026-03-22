@@ -15,8 +15,6 @@
 import os
 import random
 import time
-import sys
-
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -25,21 +23,8 @@ from tqdm import tqdm
 from ..modules import diagnostics
 from ..modules import helper
 from ..modules import utils
-from torch.nn import functional as F
 
-
-def fit(
-    config,
-    model,
-    train_dl,
-    model_children,
-    regular_param,
-    optimizer,
-    latent_dim,
-    RHO,
-    l1,
-    n_dimensions,
-):
+def fit(config, model, train_dl, model_children, regular_param, optimizer, latent_dim, RHO, l1, n_dimensions):
     """This function trains the model on the train set. It computes the losses and does the backwards propagation, and updates the optimizer as well.
     Args:
         model (modelObject): The model you wish to train
@@ -55,31 +40,21 @@ def fit(
     """
 
     print("### Beginning Training")
-
     model.train()
-
     running_loss = 0.0
+    running_mse = 0.0
+    running_l1 = 0.0
     device = helper.get_device()
 
     for idx, inputs in enumerate(tqdm(train_dl)):
-        inputs = inputs.to(device)
-
-        # Set the gradients to zero
+        inputs = inputs.to(device).float()
         optimizer.zero_grad()
-
-        # Compute the predicted outputs from the input data
         reconstructions = model(inputs)
 
-        if (
-            hasattr(config, "custom_loss_function")
-            and config.custom_loss_function == "loss_function_swae"
-        ):
+        if hasattr(config, "custom_loss_function") and config.custom_loss_function == "loss_function_swae":
             z = model.encode(inputs)
-            loss, mse_loss, l1_loss = utils.loss_function_swae(
-                inputs, z, reconstructions, latent_dim
-            )
+            loss, mse_loss, l1_loss = utils.loss_function_swae(inputs, z, reconstructions, latent_dim)
         else:
-            # Compute how far off the prediction is
             loss, mse_loss, l1_loss = utils.mse_sum_loss_l1(
                 model_children=model_children,
                 true_data=inputs,
@@ -88,21 +63,19 @@ def fit(
                 validate=True,
             )
 
-        # Compute the loss-gradient with
         loss.backward()
-
-        # Update the optimizer
         optimizer.step()
 
-        running_loss += loss.item()
+        running_loss += loss.item() if hasattr(loss, 'item') else loss
+        running_mse += mse_loss.item() if hasattr(mse_loss, 'item') else mse_loss
+        running_l1 += l1_loss.item() if hasattr(l1_loss, 'item') else l1_loss
 
     epoch_loss = running_loss / (idx + 1)
-    print(f"# Finished. Training Loss: {loss:.6f}")
-    return epoch_loss, mse_loss, l1_loss, model
-
+    print(f"Training Loss: {epoch_loss:.6f}")
+    return epoch_loss, running_mse/(idx+1), running_l1/(idx+1), model
 
 def validate(model, test_dl, model_children, reg_param):
-    """Function used to validate the training. Not necessary for doing compression, but gives a good indication of wether the model selected is a good fit or not.
+     """Function used to validate the training. Not necessary for doing compression, but gives a good indication of wether the model selected is a good fit or not.
     Args:
         model (modelObject): Defines the model one wants to validate. The model used here is passed directly from `fit()`.
         test_dl (torch.DataLoader): Defines the batched data which the model is validated on
@@ -111,18 +84,15 @@ def validate(model, test_dl, model_children, reg_param):
     Returns:
         float: Validation loss
     """
-    print("### Beginning Validating")
-
+     print("### Beginning Validating")
     model.eval()
-
     running_loss = 0.0
     device = helper.get_device()
 
     with torch.no_grad():
         for idx, inputs in enumerate(tqdm(test_dl)):
-            inputs = inputs.to(device)
+            inputs = inputs.to(device).float()
             reconstructions = model(inputs)
-
             loss, _, _ = utils.mse_sum_loss_l1(
                 model_children=model_children,
                 true_data=inputs,
@@ -130,14 +100,14 @@ def validate(model, test_dl, model_children, reg_param):
                 reg_param=reg_param,
                 validate=True,
             )
-            running_loss += loss.item()
+            running_loss += loss.item() if hasattr(loss, 'item') else loss
 
     epoch_loss = running_loss / (idx + 1)
-    print(f"# Finished. Validation Loss: {loss:.6f}")
+    print(f"Validation Loss: {epoch_loss:.6f}")
     return epoch_loss
 
-
 def seed_worker(worker_id):
+
     """PyTorch implementation to fix the seeds
     Args:
         worker_id ():
@@ -146,8 +116,8 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+def train(model, variables, train_data, test_data, project_path, config, tracker=None):
 
-def train(model, variables, train_data, test_data, project_path, config):
     """Does the entire training loop by calling the `fit()` and `validate()`. Appart from this, this is the main function where the data is converted
         to the correct type for it to be trained, via `torch.Tensor()`. Furthermore, the batching is also done here, based on `config.batch_size`,
         and it is the `torch.utils.data.DataLoader` doing the splitting.
@@ -163,7 +133,9 @@ def train(model, variables, train_data, test_data, project_path, config):
     Returns:
         modelObject: fully trained model ready to perform compression and decompression
     """
-    # Fix the random seed - TODO: add flag to make this optional
+    #Added tracker=None to accept the emissions tracker
+    device = helper.get_device()
+    model = model.to(device).float()
 
     if config.deterministic_algorithm:
         random.seed(0)
@@ -172,177 +144,71 @@ def train(model, variables, train_data, test_data, project_path, config):
         torch.use_deterministic_algorithms(True)
         g = torch.Generator()
         g.manual_seed(0)
+    else:
+        g = None
 
-    test_size = config.test_size
-    learning_rate = config.lr
-    bs = config.batch_size
-    reg_param = config.reg_param
-    rho = config.RHO
-    l1 = config.l1
-    epochs = config.epochs
-    latent_space_size = config.latent_space_size
-    intermittent_model_saving = config.intermittent_model_saving
-    intermittent_saving_patience = config.intermittent_saving_patience
+    train_tensor = torch.tensor(train_data, dtype=torch.float32)
+    valid_tensor = torch.tensor(test_data, dtype=torch.float32)
 
-    model_children = list(model.children())
-
-    # Initialize model with appropriate device
-    device = helper.get_device()
-    model = model.to(device)
-
-    # Converting data to tensors
     if config.data_dimension == 2:
         if config.model_type == "dense":
-            # print(train_data.shape)
-            # print(test_data.shape)
-            # sys.exit()
-            train_ds = torch.tensor(
-                train_data, dtype=torch.float32, device=device
-            ).view(train_data.shape[0], train_data.shape[1] * train_data.shape[2])
-            valid_ds = torch.tensor(test_data, dtype=torch.float32, device=device).view(
-                test_data.shape[0], test_data.shape[1] * test_data.shape[2]
-            )
-        elif config.model_type == "convolutional" and config.model_name == "Conv_AE_3D":
-            train_ds = torch.tensor(
-                train_data, dtype=torch.float32, device=device
-            ).view(
-                train_data.shape[0] // bs,
-                1,
-                bs,
-                train_data.shape[1],
-                train_data.shape[2],
-            )
-            valid_ds = torch.tensor(test_data, dtype=torch.float32, device=device).view(
-                train_data.shape[0] // bs,
-                1,
-                bs,
-                train_data.shape[1],
-                train_data.shape[2],
-            )
+            train_ds = train_tensor.view(train_data.shape[0], -1)
+            valid_ds = valid_tensor.view(test_data.shape[0], -1)
         elif config.model_type == "convolutional":
-            train_ds = torch.tensor(
-                train_data, dtype=torch.float32, device=device
-            ).view(train_data.shape[0], 1, train_data.shape[1], train_data.shape[2])
-            valid_ds = torch.tensor(test_data, dtype=torch.float32, device=device).view(
-                train_data.shape[0], 1, train_data.shape[1], train_data.shape[2]
-            )
-    elif config.data_dimension == 1:
-        train_ds = torch.tensor(train_data, dtype=torch.float64, device=device)
-        valid_ds = torch.tensor(test_data, dtype=torch.float64, device=device)
-
-    # Pushing input data into the torch-DataLoader object and combines into one DataLoader object (a basic wrapper
-    # around several DataLoader objects).
-
-    if config.deterministic_algorithm:
-        train_dl = DataLoader(
-            train_ds,
-            batch_size=bs,
-            shuffle=False,
-            worker_init_fn=seed_worker,
-            generator=g,
-            drop_last=False,
-        )
-        valid_dl = DataLoader(
-            valid_ds,
-            batch_size=bs,
-            worker_init_fn=seed_worker,
-            generator=g,
-            drop_last=False,
-        )
+            train_ds = train_tensor.view(train_data.shape[0], 1, train_data.shape[1], train_data.shape[2])
+            valid_ds = valid_tensor.view(test_data.shape[0], 1, test_data.shape[1], test_data.shape[2])
     else:
-        train_dl = DataLoader(
-            train_ds,
-            batch_size=bs,
-            shuffle=False,
-            drop_last=False,
-        )
-        valid_dl = DataLoader(
-            valid_ds,
-            batch_size=bs,
-            drop_last=False,
-        )
+        train_ds = train_tensor.view(train_data.shape[0], -1)
+        valid_ds = valid_tensor.view(test_data.shape[0], -1)
 
-    # Select Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=not config.deterministic_algorithm, worker_init_fn=seed_worker if g else None, generator=g)
+    valid_dl = DataLoader(valid_ds, batch_size=config.batch_size, shuffle=False)
 
-    # Activate early stopping
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    model_children = list(model.children())
+    
     if config.early_stopping:
-        early_stopping = utils.EarlyStopping(
-            patience=config.early_stopping_patience, min_delta=config.min_delta
-        )  # Changes to patience & min_delta can be made in configs
-
-    # Activate LR Scheduler
+        early_stopping = utils.EarlyStopping(patience=config.early_stopping_patience, min_delta=config.min_delta)
     if config.lr_scheduler:
-        lr_scheduler = utils.LRScheduler(
-            optimizer=optimizer, patience=config.lr_scheduler_patience
-        )
+        lr_scheduler = utils.LRScheduler(optimizer=optimizer, patience=config.lr_scheduler_patience)
 
-    # Training and Validation of the model
-    train_loss = []
-    val_loss = []
-    start = time.time()
+    train_loss, val_loss = [], []
 
-    # Registering hooks for activation extraction
     if config.activation_extraction:
         hooks = model.store_hooks()
 
-    for epoch in range(epochs):
-        print(f"Epoch {epoch + 1} of {epochs}")
+    for epoch in range(config.epochs):
+        print(f"Epoch {epoch + 1}/{config.epochs}")
 
-        train_epoch_loss, mse_loss_fit, regularizer_loss_fit, trained_model = fit(
-            config=config,
-            model=model,
-            train_dl=train_dl,
-            model_children=model_children,
-            regular_param=reg_param,
-            optimizer=optimizer,
-            latent_dim=latent_space_size,
-            RHO=rho,
-            l1=l1,
-            n_dimensions=config.data_dimension,
-        )
-        train_loss.append(train_epoch_loss)
+        t_loss, _, _, model = fit(config, model, train_dl, model_children, config.reg_param, optimizer, config.latent_space_size, config.RHO, config.l1, config.data_dimension)
+        train_loss.append(t_loss)
 
-        if test_size:
-            val_epoch_loss = validate(
-                model=trained_model,
-                test_dl=valid_dl,
-                model_children=model_children,
-                reg_param=reg_param,
-            )
-            val_loss.append(val_epoch_loss)
+        if config.test_size:
+            v_loss = validate(model, valid_dl, model_children, config.reg_param)
         else:
-            val_epoch_loss = train_epoch_loss
-            val_loss.append(val_epoch_loss)
+            v_loss = t_loss
+        val_loss.append(v_loss)
 
-        if config.lr_scheduler:
-            lr_scheduler(val_epoch_loss)
+        if config.lr_scheduler: lr_scheduler(v_loss)
+        
+        # CARBON METRICS
+        #  flush the tracker to ensure a row is written for every epoch
+        if tracker is not None:
+            tracker.flush()
+
         if config.early_stopping:
-            early_stopping(val_epoch_loss)
-            if early_stopping.early_stop:
-                break
+            early_stopping(v_loss)
+            if early_stopping.early_stop: break
 
-        ## Implementation to save models & values after every N epochs, where N is stored in 'intermittent_saving_patience':
-        if intermittent_model_saving:
-            if epoch % intermittent_saving_patience == 0:
-                path = os.path.join(project_path, f"model_{epoch}.pt")
-                helper.model_saver(model, path)
+        if config.intermittent_model_saving and epoch % config.intermittent_saving_patience == 0:
+            helper.model_saver(model, os.path.join(project_path, f"model_{epoch}.pt"))
 
-    end = time.time()
-
-    # Saving activations values
     if config.activation_extraction:
         activations = diagnostics.dict_to_square_matrix(model.get_activations())
         model.detach_hooks(hooks)
         np.save(os.path.join(project_path, "activations.npy"), activations)
 
-    print(f"{(end - start) / 60:.3} minutes")
-    np.save(
-        os.path.join(project_path, "loss_data.npy"), np.array([train_loss, val_loss])
-    )
+    np.save(os.path.join(project_path, "loss_data.npy"), np.array([train_loss, val_loss]))
 
-    if config.model_type == "convolutional":
-        final_layer = model.get_final_layer_dims()
-        np.save(os.path.join(project_path, "final_layer.npy"), np.array(final_layer))
-
-    return trained_model
+    print(f"Training Complete.")
+    return model
